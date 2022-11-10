@@ -66,6 +66,7 @@ from azure.servicebus import (ServiceBusClient, ServiceBusMessage,
                               ServiceBusReceiveMode, ServiceBusReceiver,
                               ServiceBusSender)
 from azure.servicebus.management import ServiceBusAdministrationClient
+from azure.identity import DefaultAzureCredential
 
 from kombu.utils.encoding import bytes_to_str, safe_str
 from kombu.utils.json import dumps, loads
@@ -124,6 +125,7 @@ class Channel(virtual.Channel):
         self._namespace = None
         self._policy = None
         self._sas_key = None
+        self._credential = None
         self._connection_string = None
 
         self._try_parse_connection_string()
@@ -134,18 +136,25 @@ class Channel(virtual.Channel):
         self._namespace, self._policy, self._sas_key = Transport.parse_uri(
             self.conninfo.hostname)
 
-        # Convert
-        endpoint = 'sb://' + self._namespace
-        if not endpoint.endswith('.net'):
-            endpoint += '.servicebus.windows.net'
+        fqn = self._namespace
+        if not fqn.endswith('.net'):
+            fqn += '.servicebus.windows.net'
 
-        conn_dict = {
-            'Endpoint': endpoint,
-            'SharedAccessKeyName': self._policy,
-            'SharedAccessKey': self._sas_key,
-        }
-        self._connection_string = ';'.join(
-            [key + '=' + value for key, value in conn_dict.items()])
+        if "credential" in self.connection.client.transport_options.keys():
+            self._credential = self.connection.client.transport_options["credential"]
+        elif self._policy == self._sas_key == "DefaultAzureCredential":
+            self._credential = DefaultAzureCredential()
+        else:
+            # Convert
+            endpoint = 'sb://' + fqn
+
+            conn_dict = {
+                'Endpoint': endpoint,
+                'SharedAccessKeyName': self._policy,
+                'SharedAccessKey': self._sas_key,
+            }
+            self._connection_string = ';'.join(
+                [key + '=' + value for key, value in conn_dict.items()])
 
     def basic_consume(self, queue, no_ack, *args, **kwargs):
         if no_ack:
@@ -342,20 +351,41 @@ class Channel(virtual.Channel):
     @property
     def queue_service(self) -> ServiceBusClient:
         if self._queue_service is None:
-            self._queue_service = ServiceBusClient.from_connection_string(
-                self._connection_string,
-                retry_total=self.retry_total,
-                retry_backoff_factor=self.retry_backoff_factor,
-                retry_backoff_max=self.retry_backoff_max
-            )
+            if self._connection_string:
+                self._queue_service = ServiceBusClient.from_connection_string(
+                    self._connection_string,
+                    retry_total=self.retry_total,
+                    retry_backoff_factor=self.retry_backoff_factor,
+                    retry_backoff_max=self.retry_backoff_max
+                )
+            else:
+                fqn = self._namespace
+                if not fqn.endswith('.net'):
+                    fqn += '.servicebus.windows.net'
+                self._queue_service = ServiceBusClient(
+                    fqn,
+                    self._credential,
+                    retry_total=self.retry_total,
+                    retry_backoff_factor=self.retry_backoff_factor,
+                    retry_backoff_max=self.retry_backoff_max
+                )
         return self._queue_service
 
     @property
     def queue_mgmt_service(self) -> ServiceBusAdministrationClient:
         if self._queue_mgmt_service is None:
-            self._queue_mgmt_service = \
-                ServiceBusAdministrationClient.from_connection_string(
-                    self._connection_string)
+            if self._connection_string:
+                self._queue_mgmt_service = \
+                    ServiceBusAdministrationClient.from_connection_string(
+                        self._connection_string)
+            else:
+                fqn = self._namespace
+                if not fqn.endswith('.net'):
+                    fqn += '.servicebus.windows.net'
+                self._queue_mgmt_service = ServiceBusAdministrationClient(
+                    fqn,
+                    self._credential
+                )
         return self._queue_mgmt_service
 
     @property
@@ -422,13 +452,18 @@ class Transport(virtual.Transport):
 
         # > 'rootpolicy:some/key@somenamespace'
         uri = uri.replace('azureservicebus://', '')
-        # > 'rootpolicy:some/key',  'somenamespace'
-        policykeypair, namespace = uri.rsplit('@', 1)
-        # > 'rootpolicy', 'some/key'
-        policy, sas_key = policykeypair.split(':', 1)
+        if "@" in uri:
+            # > 'rootpolicy:some/key',  'somenamespace'
+            policykeypair, namespace = uri.rsplit('@', 1)
+            # > 'rootpolicy', 'some/key'
+            policy, sas_key = policykeypair.split(':', 1)
+        else:
+            namespace = uri
+            policy = None
+            sas_key = None
 
         # Validate ASB connection string
-        if not all([namespace, policy, sas_key]):
+        if not namespace: # TODO
             raise ValueError(
                 'Need a URI like '
                 'azureservicebus://{SAS policy name}:{SAS key}@{ServiceBus Namespace} ' # noqa
