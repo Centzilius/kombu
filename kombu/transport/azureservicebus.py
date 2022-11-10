@@ -144,6 +144,12 @@ class Channel(virtual.Channel):
             self._credential = self.connection.client.transport_options["credential"]
         elif self._policy == self._sas_key == "DefaultAzureCredential":
             self._credential = DefaultAzureCredential()
+        elif not all(self._policy, self._sas_key):
+            raise ValueError(
+                'Need a URI like '
+                'azureservicebus://{SAS policy name}:{SAS key}@{ServiceBus Namespace} ' # noqa
+                'or the azure Endpoint connection string'
+            )
         else:
             # Convert
             endpoint = 'sb://' + fqn
